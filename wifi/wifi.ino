@@ -5,6 +5,7 @@ char ssid[] = "iot";
 char password[] = "overtechnicality7petrophilous";
 
 WiFiClient client;
+
 // server details
 char server[] = "3.250.38.184";
 int port = 8000;
@@ -53,8 +54,36 @@ bool connectToServer() {
   void setup() {
     Serial.begin(9600);
     delay(2000);
+
     connectToWiFi();
-    connectToServer();
+
+    if (!connectToServer()) {
+      return;
+    }
+
+    //send arrival notification at position = 0
+    int position = 0;
+
+    //post body
+    String postBody("position=");
+    postBody += position;
+
+    //Send post requests and headers
+    client.println("POST /api/arrived/ubbn0061 HTTP/1.1");
+
+    client.println("Content-Type: application/x-www-form-urlencoded");
+    client.print("Content-Length: ");
+    client.println(postBody.length());
+    client.println();
+
+    //send post body
+    client.println(postBody);
+
+    //print server response
+    delay(200);
+    while (client.available()) {
+      Serial.write(client.read());
+    }
 
     //close connection
     client.stop();
