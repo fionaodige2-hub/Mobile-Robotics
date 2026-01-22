@@ -1,0 +1,297 @@
+// ================== WIFI + STATE-BASED LINE FOLLOWER ==================
+#include <WiFi.h>
+
+// -------- WiFi details --------
+const char* ssid     = "iot";
+const char* password = "overtechnicality7petrophilous";
+
+// Test server details
+const char* SERVER_HOST = "3.250.38.184";
+const uint16_t SERVER_PORT = 8000;
+
+WiFiClient client;
+
+// ================== MOTOR PINS ==================
+// Motor pin definitions (CHANGE if needed)
+int motor1PWM   = 37;   // AENABLE
+int motor1Phase = 38;   // APHASE
+
+int motor2PWM   = 39;   // BENABLE
+int motor2Phase = 20;   // BPHASE
+
+// ================== LINE SENSORS & CONTROL ==================
+// -------------------- Line sensors --------------------
+int AnalogValue[5] = {0,0,0,0,0};
+int AnalogPin[5]   = {4,5,6,7,15};   // keeping 8 free for music 
+
+// Threshold: decide "white line" vs "black background"
+int THRESH = 1500;  // <-- CALIBRATE 
+
+// Simple speed settings (you will tune these)
+int BASE_L = 200;
+int BASE_R = 200;
+
+// Proportional steering gain (tune)
+int KP = 60;
+
+// Median filter buffers (last 5 samples per sensor) for robustness 
+int buf[5][5] = {0};
+int bufIdx = 0;
+
+// Return median of 5 numbers (helper for filtering)
+int median5(int a, int b, int c, int d, int e) {
+  int x[5] = {a,b,c,d,e};
+  // simple sort (5 items)
+  for (int i=0;i<5;i++){
+    for (int j=i+1;j<5;j++){
+      if (x[j] < x[i]) { int t=x[i]; x[i]=x[j]; x[j]=t; }
+    }
+  }
+  return x[2];
+}
+
+// -------------------- STATE MACHINE --------------------
+enum RobotState {
+  FOLLOW_LINE,
+  TURNING_LEFT
+  // TURNING_RIGHT, STOPPED can be added later
+};
+
+RobotState state = FOLLOW_LINE;
+
+// For turning logic
+unsigned long turnStartMs = 0;
+
+// Routing / positions
+int currentPosition    = 0;   // where we think we are on the route
+int lastSentPosition   = -1;  // last position sent to server
+
+// ================== WIFI HELPERS ==================
+void connectToWiFi() {
+  Serial.print("Connecting to network: ");
+  Serial.print(ssid);
+  Serial.flush();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    Serial.flush();
+    delay(300);
+  }
+  Serial.println(" Connected");
+
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// reconnect if dropped
+void ensureWiFiConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi dropped, reconnecting...");
+    connectToWiFi();
+  }
+}
+
+// Send a simple "position" message to the server
+void sendPositionToServer(int pos) {
+  ensureWiFiConnected();
+
+  Serial.print("Connecting to server ");
+  Serial.print(SERVER_HOST);
+  Serial.print(":");
+  Serial.println(SERVER_PORT);
+
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println("Connection to server failed");
+    return;
+  }
+
+  // Message format: just "0\n", "1\n", etc.
+  String msg = String(pos) + "\n";
+  client.print(msg);
+  client.flush();
+
+  Serial.print("Sent to server: ");
+  Serial.println(msg);
+
+  client.stop();
+}
+
+// ================== MOTOR FUNCTIONS ==================
+
+void GoForward(int time,int speed1,int speed2)
+{
+  digitalWrite(motor1Phase, HIGH);
+  digitalWrite(motor2Phase, HIGH);
+  analogWrite(motor1PWM, speed1);
+  analogWrite(motor2PWM, speed2);
+  if (time > 0) delay(time);
+}
+
+void GoBackward(int time,int speed1,int speed2)
+{
+  digitalWrite(motor1Phase, LOW);
+  digitalWrite(motor2Phase, LOW);
+  analogWrite(motor1PWM, speed1);
+  analogWrite(motor2PWM, speed2);
+  if (time > 0) delay(time);
+}
+
+void GoStop(int time)
+{
+  analogWrite(motor1PWM, 0);
+  analogWrite(motor2PWM, 0);
+  delay(time);
+}
+
+// ================== SETUP ==================
+
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(motor1PWM, OUTPUT);
+  pinMode(motor1Phase, OUTPUT);
+  pinMode(motor2PWM, OUTPUT);
+  pinMode(motor2Phase, OUTPUT);
+
+  // Ensure motors off at boot
+  GoStop(0);
+
+  // Connect to WiFi once at startup
+  connectToWiFi();
+
+  // Start at position 0 and tell the server once
+  currentPosition  = 0;
+  sendPositionToServer(currentPosition);
+  lastSentPosition = currentPosition;
+}
+
+// ================== MAIN LOOP ==================
+
+void loop()
+{
+  // 1) Read sensors (raw), store into 5-sample buffers
+  for (int i=0; i<5; i++) {
+    int raw = analogRead(AnalogPin[i]);
+    buf[i][bufIdx] = raw;
+  }
+  bufIdx = (bufIdx + 1) % 5;
+
+  // 2) Filter each sensor with median of last 5 (more robust than single readings)
+  for (int i=0; i<5; i++) {
+    AnalogValue[i] = median5(buf[i][0], buf[i][1], buf[i][2], buf[i][3], buf[i][4]);
+  }
+
+  // 3) Convert to "on white line?" bits.
+  //    We assume WHITE line gives LOWER reading than BLACK
+  int L2 = (AnalogValue[0] < THRESH) ? 1 : 0;  // far left
+  int L1 = (AnalogValue[1] < THRESH) ? 1 : 0;  // left
+  int C  = (AnalogValue[2] < THRESH) ? 1 : 0;  // centre
+  int R1 = (AnalogValue[3] < THRESH) ? 1 : 0;  // right
+  int R2 = (AnalogValue[4] < THRESH) ? 1 : 0;  // far right
+
+  // 4) Compute an "error" (negative = line is left, positive = line is right)
+  int seen = L2 + L1 + C + R1 + R2;
+
+  int error = (-2 * L2) + (-1 * L1) + (0 * C) + (1 * R1) + (2 * R2);
+
+  // If multiple sensors see the line at once, average it
+  if (seen > 0) error = error / seen;
+
+  // Give far sensors extra influence on tight bends
+  if (L2) error = -2;
+  if (R2) error =  2;
+
+  // Junction detection: L1 + C + R1 all on white
+  bool atJunction = (L1 && C && R1);
+
+  static int lastError = 0;
+
+  int leftSpeed  = BASE_L;
+  int rightSpeed = BASE_R;
+
+  // -------------------- STATE MACHINE LOGIC --------------------
+  switch (state) {
+
+    case FOLLOW_LINE:
+    {
+      // --- P-control line following ---
+      int turn = (KP * error * (BASE_L + BASE_R)) / 220; 
+
+      int MAX_TURN = (BASE_L + BASE_R) / 2;   // dynamic: bigger base allows bigger turn
+      if (turn >  MAX_TURN) turn =  MAX_TURN;
+      if (turn < -MAX_TURN) turn = -MAX_TURN;
+
+      leftSpeed  = BASE_L - turn;
+      rightSpeed = BASE_R + turn;
+
+      // Clamp to valid PWM range
+      if (leftSpeed  < 0)   leftSpeed = 0;
+      if (rightSpeed < 0)   rightSpeed = 0;
+      if (leftSpeed  > 255) leftSpeed = 255;
+      if (rightSpeed > 255) rightSpeed = 255;
+
+      // Handle "lost line" case (no sensors detect line)
+      if (seen == 0) {
+        if (lastError >= 0) {
+          // last saw line on right -> rotate right gently
+          leftSpeed  = 120;
+          rightSpeed = 60;
+        } else {
+          // last saw line on left -> rotate left gently
+          leftSpeed  = 60;
+          rightSpeed = 120;
+        }
+      } else {
+        lastError = error;
+      }
+
+      // ---- Transition: detect junction and start a turn ----
+      if (atJunction) {
+        state = TURNING_LEFT;         // for now always turn left
+        turnStartMs = millis();       // remember when we started turning
+      }
+    }
+    break;
+
+
+    case TURNING_LEFT:
+    {
+      // Ignore normal line-follow error; force a left turn
+      leftSpeed  = 80;
+      rightSpeed = 200;
+
+      // sensor-based exit: when centre sees line again (and not all three on)
+      bool centreOnLineOnly = C && !(L1 || R1);
+
+      // safety timeout so it can't get stuck forever
+      bool timeout = (millis() - turnStartMs) > 1200; // 1.2 seconds, tune if needed
+
+      if (centreOnLineOnly || timeout) {
+        state = FOLLOW_LINE;
+        lastError = 0;      // reset controller
+
+        // ---- ROUTING: we've just completed a junction turn ----
+        // For now: assume we started at 0, and first junction leads to 1.
+        if (currentPosition == 0) {
+          currentPosition = 1;
+        }
+        // later you can add: else if (currentPosition == 1) currentPosition = 4; etc.
+
+        // Send new position if not already sent
+        if (currentPosition != lastSentPosition) {
+          sendPositionToServer(currentPosition);
+          lastSentPosition = currentPosition;
+        }
+      }
+    }
+    break;
+
+  } // end switch(state)
+
+  // 7) Drive forward with adjusted speeds (no long delay, keep looping fast)
+  GoForward(0, leftSpeed, rightSpeed);
+
+  delay(3); // small control loop delay (fast)
+}
