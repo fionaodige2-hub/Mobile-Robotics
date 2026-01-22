@@ -1,4 +1,4 @@
-// ================== WIFI + STATE-BASED LINE FOLLOWER ==================
+// ================== WIFI + STATE-BASED LINE FOLLOWER (0→1→2→3→4→5) ==================
 #include <WiFi.h>
 
 // -------- WiFi details --------
@@ -12,7 +12,6 @@ const uint16_t SERVER_PORT = 8000;
 WiFiClient client;
 
 // ================== MOTOR PINS ==================
-// Motor pin definitions (CHANGE if needed)
 int motor1PWM   = 37;   // AENABLE
 int motor1Phase = 38;   // APHASE
 
@@ -20,28 +19,21 @@ int motor2PWM   = 39;   // BENABLE
 int motor2Phase = 20;   // BPHASE
 
 // ================== LINE SENSORS & CONTROL ==================
-// -------------------- Line sensors --------------------
 int AnalogValue[5] = {0,0,0,0,0};
 int AnalogPin[5]   = {4,5,6,7,15};   // keeping 8 free for music 
 
-// Threshold: decide "white line" vs "black background"
-int THRESH = 1500;  // <-- CALIBRATE 
+int THRESH = 1500;  // <-- CALIBRATE FOR YOUR TRACK
 
-// Simple speed settings (you will tune these)
 int BASE_L = 200;
 int BASE_R = 200;
+int KP     = 60;
 
-// Proportional steering gain (tune)
-int KP = 60;
-
-// Median filter buffers (last 5 samples per sensor) for robustness 
+// Median filter buffers (last 5 samples per sensor)
 int buf[5][5] = {0};
 int bufIdx = 0;
 
-// Return median of 5 numbers (helper for filtering)
 int median5(int a, int b, int c, int d, int e) {
   int x[5] = {a,b,c,d,e};
-  // simple sort (5 items)
   for (int i=0;i<5;i++){
     for (int j=i+1;j<5;j++){
       if (x[j] < x[i]) { int t=x[i]; x[i]=x[j]; x[j]=t; }
@@ -54,17 +46,17 @@ int median5(int a, int b, int c, int d, int e) {
 enum RobotState {
   FOLLOW_LINE,
   TURNING_LEFT
-  // TURNING_RIGHT, STOPPED can be added later
 };
 
 RobotState state = FOLLOW_LINE;
-
-// For turning logic
 unsigned long turnStartMs = 0;
 
-// Routing / positions
-int currentPosition    = 0;   // where we think we are on the route
-int lastSentPosition   = -1;  // last position sent to server
+// -------------------- ROUTING / POSITIONS --------------------
+int  currentPosition      = 0;   // start at junction 0
+int  lastSentPosition     = -1;  // last position reported to server
+bool prevAtJunction       = false;
+int  junctionStableCount  = 0;
+const int MIN_JUNCTION_SAMPLES = 3;  // how many loops pattern must persist
 
 // ================== WIFI HELPERS ==================
 void connectToWiFi() {
@@ -79,12 +71,10 @@ void connectToWiFi() {
     delay(300);
   }
   Serial.println(" Connected");
-
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 }
 
-// reconnect if dropped
 void ensureWiFiConnected() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi dropped, reconnecting...");
@@ -92,7 +82,6 @@ void ensureWiFiConnected() {
   }
 }
 
-// Send a simple "position" message to the server
 void sendPositionToServer(int pos) {
   ensureWiFiConnected();
 
@@ -106,8 +95,7 @@ void sendPositionToServer(int pos) {
     return;
   }
 
-  // Message format: just "0\n", "1\n", etc.
-  String msg = String(pos) + "\n";
+  String msg = String(pos) + "\n";  // "0\n", "1\n", ...
   client.print(msg);
   client.flush();
 
@@ -118,7 +106,6 @@ void sendPositionToServer(int pos) {
 }
 
 // ================== MOTOR FUNCTIONS ==================
-
 void GoForward(int time,int speed1,int speed2)
 {
   digitalWrite(motor1Phase, HIGH);
@@ -145,7 +132,6 @@ void GoStop(int time)
 }
 
 // ================== SETUP ==================
-
 void setup()
 {
   Serial.begin(9600);
@@ -155,59 +141,72 @@ void setup()
   pinMode(motor2PWM, OUTPUT);
   pinMode(motor2Phase, OUTPUT);
 
-  // Ensure motors off at boot
-  GoStop(0);
+  GoStop(0);           // motors off
+  connectToWiFi();     // connect once
 
-  // Connect to WiFi once at startup
-  connectToWiFi();
-
-  // Start at position 0 and tell the server once
+  // starting at junction 0
   currentPosition  = 0;
   sendPositionToServer(currentPosition);
   lastSentPosition = currentPosition;
 }
 
 // ================== MAIN LOOP ==================
-
 void loop()
 {
-  // 1) Read sensors (raw), store into 5-sample buffers
+  // 1) Read sensors + median filter
   for (int i=0; i<5; i++) {
     int raw = analogRead(AnalogPin[i]);
     buf[i][bufIdx] = raw;
   }
   bufIdx = (bufIdx + 1) % 5;
 
-  // 2) Filter each sensor with median of last 5 (more robust than single readings)
   for (int i=0; i<5; i++) {
     AnalogValue[i] = median5(buf[i][0], buf[i][1], buf[i][2], buf[i][3], buf[i][4]);
   }
 
-  // 3) Convert to "on white line?" bits.
-  //    We assume WHITE line gives LOWER reading than BLACK
-  int L2 = (AnalogValue[0] < THRESH) ? 1 : 0;  // far left
-  int L1 = (AnalogValue[1] < THRESH) ? 1 : 0;  // left
-  int C  = (AnalogValue[2] < THRESH) ? 1 : 0;  // centre
-  int R1 = (AnalogValue[3] < THRESH) ? 1 : 0;  // right
-  int R2 = (AnalogValue[4] < THRESH) ? 1 : 0;  // far right
+  int L2 = (AnalogValue[0] < THRESH) ? 1 : 0;
+  int L1 = (AnalogValue[1] < THRESH) ? 1 : 0;
+  int C  = (AnalogValue[2] < THRESH) ? 1 : 0;
+  int R1 = (AnalogValue[3] < THRESH) ? 1 : 0;
+  int R2 = (AnalogValue[4] < THRESH) ? 1 : 0;
 
-  // 4) Compute an "error" (negative = line is left, positive = line is right)
-  int seen = L2 + L1 + C + R1 + R2;
-
+  int seen  = L2 + L1 + C + R1 + R2;
   int error = (-2 * L2) + (-1 * L1) + (0 * C) + (1 * R1) + (2 * R2);
 
-  // If multiple sensors see the line at once, average it
   if (seen > 0) error = error / seen;
-
-  // Give far sensors extra influence on tight bends
   if (L2) error = -2;
   if (R2) error =  2;
 
-  // Junction detection: L1 + C + R1 all on white
-  bool atJunction = (L1 && C && R1);
+  // -------- Junction detection: vertical bar under front sensors --------
+  // Base pattern: centre + inner left + inner right on white
+  // bool junctionPattern = (L1 && C && R1);
+  bool junctionPattern = (L1 && L2 && C && R1 &&);
+
+  // OPTIONAL stricter pattern (uncomment if your bar is wide enough)
+  // bool junctionPattern = (L2 && L1 && C && R1 && R2);
+
+  // make sure pattern is stable for a few loops
+  if (junctionPattern) {
+    junctionStableCount++;
+  } else {
+    junctionStableCount = 0;
+  }
+
+  bool atJunction = (junctionStableCount >= MIN_JUNCTION_SAMPLES);
+
+  // ----- POSITION COUNTING: 0 → 1 → 2 → 3 → 4 → 5 -----
+  if (atJunction && !prevAtJunction) {  // rising edge
+    if (currentPosition < 5) {
+      currentPosition++;      // 0->1->2->3->4->5
+      if (currentPosition != lastSentPosition) {
+        sendPositionToServer(currentPosition);
+        lastSentPosition = currentPosition;
+      }
+    }
+  }
+  prevAtJunction = atJunction;
 
   static int lastError = 0;
-
   int leftSpeed  = BASE_L;
   int rightSpeed = BASE_R;
 
@@ -216,30 +215,24 @@ void loop()
 
     case FOLLOW_LINE:
     {
-      // --- P-control line following ---
-      int turn = (KP * error * (BASE_L + BASE_R)) / 220; 
-
-      int MAX_TURN = (BASE_L + BASE_R) / 2;   // dynamic: bigger base allows bigger turn
+      int turn = (KP * error * (BASE_L + BASE_R)) / 220;
+      int MAX_TURN = (BASE_L + BASE_R) / 2;
       if (turn >  MAX_TURN) turn =  MAX_TURN;
       if (turn < -MAX_TURN) turn = -MAX_TURN;
 
       leftSpeed  = BASE_L - turn;
       rightSpeed = BASE_R + turn;
 
-      // Clamp to valid PWM range
-      if (leftSpeed  < 0)   leftSpeed = 0;
+      if (leftSpeed  < 0)   leftSpeed  = 0;
       if (rightSpeed < 0)   rightSpeed = 0;
-      if (leftSpeed  > 255) leftSpeed = 255;
+      if (leftSpeed  > 255) leftSpeed  = 255;
       if (rightSpeed > 255) rightSpeed = 255;
 
-      // Handle "lost line" case (no sensors detect line)
       if (seen == 0) {
         if (lastError >= 0) {
-          // last saw line on right -> rotate right gently
           leftSpeed  = 120;
           rightSpeed = 60;
         } else {
-          // last saw line on left -> rotate left gently
           leftSpeed  = 60;
           rightSpeed = 120;
         }
@@ -247,51 +240,30 @@ void loop()
         lastError = error;
       }
 
-      // ---- Transition: detect junction and start a turn ----
+      // enter TURNING_LEFT whenever we are on a junction
       if (atJunction) {
-        state = TURNING_LEFT;         // for now always turn left
-        turnStartMs = millis();       // remember when we started turning
+        state = TURNING_LEFT;
+        turnStartMs = millis();
       }
     }
     break;
-
 
     case TURNING_LEFT:
     {
-      // Ignore normal line-follow error; force a left turn
       leftSpeed  = 80;
       rightSpeed = 200;
 
-      // sensor-based exit: when centre sees line again (and not all three on)
       bool centreOnLineOnly = C && !(L1 || R1);
-
-      // safety timeout so it can't get stuck forever
-      bool timeout = (millis() - turnStartMs) > 1200; // 1.2 seconds, tune if needed
+      bool timeout          = (millis() - turnStartMs) > 1200; // 1.2 s
 
       if (centreOnLineOnly || timeout) {
         state = FOLLOW_LINE;
-        lastError = 0;      // reset controller
-
-        // ---- ROUTING: we've just completed a junction turn ----
-        // For now: assume we started at 0, and first junction leads to 1.
-        if (currentPosition == 0) {
-          currentPosition = 1;
-        }
-        // later you can add: else if (currentPosition == 1) currentPosition = 4; etc.
-
-        // Send new position if not already sent
-        if (currentPosition != lastSentPosition) {
-          sendPositionToServer(currentPosition);
-          lastSentPosition = currentPosition;
-        }
+        lastError = 0;
       }
     }
     break;
+  }
 
-  } // end switch(state)
-
-  // 7) Drive forward with adjusted speeds (no long delay, keep looping fast)
   GoForward(0, leftSpeed, rightSpeed);
-
-  delay(3); // small control loop delay (fast)
+  delay(3);
 }
