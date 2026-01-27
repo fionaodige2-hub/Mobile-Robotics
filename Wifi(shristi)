@@ -1,0 +1,88 @@
+#include <WiFi.h>
+
+// ================= WIFI DETAILS =================
+const char* ssid     = "iPhone";
+const char* password = "sunnyside";
+
+// ================= SERVER DETAILS =================
+const char* SERVER_HOST = "3.250.38.184";   // test server IP
+const int   SERVER_PORT = 8000;
+
+// ================= TEAM ID =================
+const char* TEAM_ID = "team_12";
+
+WiFiClient client;
+
+// ================= WIFI CONNECT =================
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= SEND POSITION =================
+void sendPosition(int position) {
+  Serial.print("Connecting to server ");
+  Serial.print(SERVER_HOST);
+  Serial.print(":");
+  Serial.println(SERVER_PORT);
+
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println("❌ Server connection failed");
+    return;
+  }
+
+  // Build POST body
+  String postBody = "position=" + String(position);
+
+  // Build URL with team ID
+  String url = "/api/arrived/" + String(TEAM_ID);
+
+  // HTTP POST request
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: " + String(SERVER_HOST));
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postBody.length());
+  client.println();
+  client.println(postBody);
+
+  Serial.println("✅ Sent position to server:");
+  Serial.println(postBody);
+
+  // Read response (optional, for debugging)
+  delay(200);
+  while (client.available()) {
+    Serial.write(client.read());
+  }
+
+  client.stop();
+  Serial.println("\nDisconnected from server");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  connectToWiFi();
+
+  // Send initial position = 0
+  sendPosition(0);
+}
+
+// ================= LOOP =================
+void loop() {
+  // Nothing here yet
+  // Later: send new positions when robot reaches them
+}
