@@ -1,0 +1,239 @@
+#include <WiFi.h>
+
+// ================= WIFI + SERVER =================
+const char* ssid       = "iot";
+const char* password   = "overtechnicality7petrophilous";
+const char* SERVER_HOST = "3.250.38.184";   // test server IP
+const int   SERVER_PORT = 8000;
+const char* ROBOT_ID    = "ubbn0061";
+
+WiFiClient client;
+
+// junction chosen by server (default: none)
+int stopJunction = -1;   // -1 means "no target set yet"
+
+// ================= WIFI CONNECT =================
+void connectToWiFi() {
+  Serial.print("Connecting to "); 
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+
+  Serial.println();
+  Serial.println("Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= HTTP HELPERS =================
+#define BUFSIZE 512
+
+String readResponse() {
+  char buffer[BUFSIZE] = {0};
+  unsigned long start = millis();
+
+  while (!client.available() && millis() - start < 3000) {
+    delay(10);
+  }
+
+  int n = client.readBytes(buffer, BUFSIZE - 1);
+  buffer[n] = '\0';
+  return String(buffer);
+}
+
+String getResponseBody(String &response) {
+  int split = response.indexOf("\r\n\r\n");
+  if (split < 0) return "";
+  String body = response.substring(split + 4);
+  body.trim();
+  return body;
+}
+
+// ================= SEND POSITION TO SERVER =================
+bool sendArrivedPosition(int position) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println("[HTTP] Connect failed");
+    return false;
+  }
+
+  String postBody = "position=" + String(position);
+  String path     = String("/api/arrived/") + ROBOT_ID;
+
+  client.print("POST " + path + " HTTP/1.1\r\n");
+  client.print("Host: "); 
+  client.println(SERVER_HOST);
+  client.println("Connection: close");
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postBody.length());
+  client.println();
+  client.println(postBody);
+
+  String resp  = readResponse();
+  String body  = getResponseBody(resp);
+
+  // Try to interpret body as a junction number from server
+  if (body.length()) {
+    int val = body.toInt();
+    if (!(val == 0 && body.charAt(0) != '0')) {
+      stopJunction = val;
+      Serial.print("server selected stopJunction = ");
+      Serial.println(stopJunction);
+    }
+  }
+
+  client.stop();
+  return true;
+}
+
+// ================== LINE FOLLOWER CODE ==================
+
+// ====== MOTORS ======
+const int M1PWM = 37, M1PH = 38;
+const int M2PWM = 39, M2PH = 20;
+
+// ====== SENSORS ======
+const int N_SENS = 5;
+int analogVal[N_SENS];
+const int analogPin[N_SENS] = {4,5,6,7,15};
+
+int THRESH = 1500;
+int BASE_L = 200, BASE_R = 200;
+int KP     = 60;
+
+int buf[N_SENS][5];
+int bufIdx = 0;
+
+// Junction tracking
+int  junctionIndex   = 0;    // we want first REAL junction to be 0
+const int NUM_JUNCTS = 5;
+bool wasAtJunction   = false;
+bool firstJunctionSeen = false;  // <--- NEW: to skip the starting tile
+
+// ---- helpers ----
+int median5(int v[5]) {
+  for (int i=0;i<5;i++)
+    for (int j=i+1;j<5;j++)
+      if (v[j] < v[i]) { int t=v[i]; v[i]=v[j]; v[j]=t; }
+  return v[2];
+}
+
+void GoForward(int t,int s1,int s2){
+  digitalWrite(M1PH,HIGH); 
+  digitalWrite(M2PH,HIGH);
+  analogWrite(M1PWM,s1);   
+  analogWrite(M2PWM,s2);
+  if (t>0) delay(t);
+}
+
+void GoStop(int t){
+  analogWrite(M1PWM,0); 
+  analogWrite(M2PWM,0);
+  delay(t);
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  connectToWiFi();
+
+  pinMode(M1PWM,OUTPUT); pinMode(M1PH,OUTPUT);
+  pinMode(M2PWM,OUTPUT); pinMode(M2PH,OUTPUT);
+
+  // no initial junction sent here
+}
+
+// ================= LOOP =================
+void loop() {
+  // 1) Read & buffer
+  for (int i=0;i<N_SENS;i++) buf[i][bufIdx] = analogRead(analogPin[i]);
+  bufIdx = (bufIdx+1)%5;
+
+  // 2) Median filter
+  for (int i=0;i<N_SENS;i++) {
+    int tmp[5];
+    for (int k=0;k<5;k++) tmp[k]=buf[i][k];
+    analogVal[i] = median5(tmp);
+  }
+
+  // 3) Threshold -> bits
+  int L2 = analogVal[0] < THRESH;
+  int L1 = analogVal[1] < THRESH;
+  int C  = analogVal[2] < THRESH;
+  int R1 = analogVal[3] < THRESH;
+  int R2 = analogVal[4] < THRESH;
+
+  // ---------- Junction detection ----------
+  bool atJunction = (L2 && L1 && C && R1 && R2);
+
+  if (atJunction && !wasAtJunction) {
+    if (!firstJunctionSeen) {
+      // This is the starting "junction" under the robot when it powers on.
+      // We mark it but do NOT count it, do NOT send it.
+      firstJunctionSeen = true;
+      // Do nothing else.
+    } else {
+      // Real junctions from now on: 0, 1, 2, ...
+      Serial.print("at junction=");
+      Serial.println(junctionIndex);
+
+      GoStop(300);
+      sendArrivedPosition(junctionIndex);
+
+      if (stopJunction >= 0 && junctionIndex == stopJunction) {
+        Serial.println("Final junction reached. Stopping forever.");
+        while (true) {
+          GoStop(1000);
+        }
+      }
+
+      GoStop(2000);
+
+      junctionIndex++;
+      if (junctionIndex >= NUM_JUNCTS) {
+        junctionIndex = 0;   // wrap around if you want 0..NUM_JUNCTS-1 cyclically
+      }
+    }
+  }
+
+  wasAtJunction = atJunction;
+  // ---------- end junction code ----------
+
+  // 4) Error
+  int seen  = L2+L1+C+R1+R2;
+  int error = -2*L2 -1*L1 +0*C +1*R1 +2*R2;
+  if (seen>0) error /= seen;
+  if (L2) error = -2;
+  if (R2) error =  2;
+
+  // 5) P-control
+  int turn = (KP * error * (BASE_L+BASE_R))/220;
+  int maxTurn = (BASE_L+BASE_R)/2;
+  turn = constrain(turn,-maxTurn,maxTurn);
+
+  int left  = BASE_L - turn;
+  int right = BASE_R + turn;
+  left  = constrain(left, 0,255);
+  right = constrain(right,0,255);
+
+  // 6) Lost line
+  static int lastError = 0;
+  if (!seen) {
+    if (lastError >= 0) { left=120; right=60; }
+    else                { left=60;  right=120; }
+  } else {
+    lastError = error;
+  }
+
+  // 7) Drive
+  GoForward(0,left,right);
+  delay(1);
+}
